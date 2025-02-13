@@ -1,0 +1,86 @@
+import { IDataObject } from 'n8n-workflow';
+import { mock } from 'jest-mock-extended';
+import { ImapSimple } from '@n8n/imap';
+import { getNewEmails } from '../../v2/getNewEmails.util';
+import { triggerFunctions } from './triggerFunctionsMock';
+
+describe('Test IMap V2 utils', () => {
+	afterEach(() => jest.resetAllMocks());
+
+	describe('getNewEmails', () => {
+		const message = {
+			attributes: {
+				uuid: 1,
+				struct: {},
+			},
+			parts: [
+				{ which: '', body: 'Body content' },
+				{ which: 'HEADER', body: 'h' },
+				{ which: 'TEXT', body: 'txt' },
+			],
+		};
+
+		const staticData: IDataObject = {};
+		const imapConnection = mock<ImapSimple>({
+			search: jest.fn().mockReturnValue(Promise.resolve([message])),
+		});
+		const getText = jest.fn().mockReturnValue('text');
+		const getAttachment = jest.fn().mockReturnValue(['attachment']);
+
+		it('should return new emails', async () => {
+			const expectedResults = [
+				{
+					format: 'resolved',
+					expected: {
+						json: {
+							attachments: undefined,
+							headers: { '': 'Body content' },
+							headerLines: undefined,
+							html: false,
+						},
+						binary: undefined,
+					},
+				},
+				{
+					format: 'simple',
+					expected: {
+						json: {
+							textHtml: 'text',
+							textPlain: 'text',
+							metadata: {
+								'0': 'h',
+							},
+						},
+					},
+				},
+				{
+					format: 'raw',
+					expected: {
+						json: { raw: 'txt' },
+					},
+				},
+			];
+
+			expectedResults.forEach(async (expectedResult) => {
+				triggerFunctions.getNodeParameter
+					.calledWith('format')
+					.mockReturnValue(expectedResult.format);
+				triggerFunctions.getNodeParameter
+					.calledWith('dataPropertyAttachmentsPrefixName')
+					.mockReturnValue('resolved');
+
+				const result = getNewEmails.call(
+					triggerFunctions,
+					imapConnection,
+					[],
+					staticData,
+					'',
+					getText,
+					getAttachment,
+				);
+
+				expect(result).resolves.toEqual([expectedResult.expected]);
+			});
+		});
+	});
+});
