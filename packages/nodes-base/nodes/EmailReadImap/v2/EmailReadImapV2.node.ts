@@ -1,6 +1,5 @@
 import type { ImapSimple, ImapSimpleOptions, Message, MessagePart } from '@n8n/imap';
-import { connect as imapConnect, getParts } from '@n8n/imap';
-import find from 'lodash/find';
+import { connect as imapConnect } from '@n8n/imap';
 import isEmpty from 'lodash/isEmpty';
 import type { Source as ParserSource } from 'mailparser';
 import { simpleParser } from 'mailparser';
@@ -17,13 +16,13 @@ import type {
 	INodeTypeBaseDescription,
 	INodeTypeDescription,
 	ITriggerResponse,
-	JsonObject,
 } from 'n8n-workflow';
 import { NodeConnectionType, NodeOperationError, TriggerCloseError } from 'n8n-workflow';
 import rfc2047 from 'rfc2047';
 
 import type { ICredentialsDataImap } from '../../../credentials/Imap.credentials';
 import { isCredentialsDataImap } from '../../../credentials/Imap.credentials';
+import { establishConnection } from './establishConnection.util';
 
 export async function parseRawEmail(
 	this: ITriggerFunctions,
@@ -291,7 +290,7 @@ export class EmailReadImapV2 implements INodeType {
 		const staticData = this.getWorkflowStaticData('node');
 		this.logger.debug('Loaded static data for node "EmailReadImap"', { staticData });
 
-		let connection: ImapSimple;
+		let connection: ImapSimple | undefined;
 		let closeFunctionWasCalled = false;
 		let isCurrentlyReconnecting = false;
 
@@ -318,6 +317,10 @@ export class EmailReadImapV2 implements INodeType {
 			}
 
 			try {
+				if (!connection) {
+					return '';
+				}
+
 				const partData = await connection.getPartData(message, part);
 				return partData.toString();
 			} catch {
@@ -369,276 +372,21 @@ export class EmailReadImapV2 implements INodeType {
 			return await Promise.all(attachmentPromises);
 		};
 
-		// Returns all the new unseen messages
-		const getNewEmails = async (
-			imapConnection: ImapSimple,
-			searchCriteria: Array<string | string[]>,
-		): Promise<INodeExecutionData[]> => {
-			const format = this.getNodeParameter('format', 0) as string;
-
-			let fetchOptions = {};
-
-			if (format === 'simple' || format === 'raw') {
-				fetchOptions = {
-					bodies: ['TEXT', 'HEADER'],
-					markSeen: false,
-					struct: true,
-				};
-			} else if (format === 'resolved') {
-				fetchOptions = {
-					bodies: [''],
-					markSeen: false,
-					struct: true,
-				};
-			}
-
-			const results = await imapConnection.search(searchCriteria, fetchOptions);
-
-			const newEmails: INodeExecutionData[] = [];
-			let newEmail: INodeExecutionData;
-			let attachments: IBinaryData[];
-			let propertyName: string;
-
-			// All properties get by default moved to metadata except the ones
-			// which are defined here which get set on the top level.
-			const topLevelProperties = ['cc', 'date', 'from', 'subject', 'to'];
-
-			if (format === 'resolved') {
-				const dataPropertyAttachmentsPrefixName = this.getNodeParameter(
-					'dataPropertyAttachmentsPrefixName',
-				) as string;
-
-				for (const message of results) {
-					if (
-						staticData.lastMessageUid !== undefined &&
-						message.attributes.uid <= (staticData.lastMessageUid as number)
-					) {
-						continue;
-					}
-					if (
-						staticData.lastMessageUid === undefined ||
-						(staticData.lastMessageUid as number) < message.attributes.uid
-					) {
-						staticData.lastMessageUid = message.attributes.uid;
-					}
-					const part = find(message.parts, { which: '' });
-
-					if (part === undefined) {
-						throw new NodeOperationError(this.getNode(), 'Email part could not be parsed.');
-					}
-					const parsedEmail = await parseRawEmail.call(
-						this,
-						part.body as Buffer,
-						dataPropertyAttachmentsPrefixName,
-					);
-
-					newEmails.push(parsedEmail);
-				}
-			} else if (format === 'simple') {
-				const downloadAttachments = this.getNodeParameter('downloadAttachments') as boolean;
-
-				let dataPropertyAttachmentsPrefixName = '';
-				if (downloadAttachments) {
-					dataPropertyAttachmentsPrefixName = this.getNodeParameter(
-						'dataPropertyAttachmentsPrefixName',
-					) as string;
-				}
-
-				for (const message of results) {
-					if (
-						staticData.lastMessageUid !== undefined &&
-						message.attributes.uid <= (staticData.lastMessageUid as number)
-					) {
-						continue;
-					}
-					if (
-						staticData.lastMessageUid === undefined ||
-						(staticData.lastMessageUid as number) < message.attributes.uid
-					) {
-						staticData.lastMessageUid = message.attributes.uid;
-					}
-					const parts = getParts(message.attributes.struct as IDataObject[]);
-
-					newEmail = {
-						json: {
-							textHtml: await getText(parts, message, 'html'),
-							textPlain: await getText(parts, message, 'plain'),
-							metadata: {} as IDataObject,
-						},
-					};
-
-					const messageHeader = message.parts.filter((part) => part.which === 'HEADER');
-
-					const messageBody = messageHeader[0].body as Record<string, string[]>;
-					for (propertyName of Object.keys(messageBody)) {
-						if (messageBody[propertyName].length) {
-							if (topLevelProperties.includes(propertyName)) {
-								newEmail.json[propertyName] = messageBody[propertyName][0];
-							} else {
-								(newEmail.json.metadata as IDataObject)[propertyName] =
-									messageBody[propertyName][0];
-							}
-						}
-					}
-
-					if (downloadAttachments) {
-						// Get attachments and add them if any get found
-						attachments = await getAttachment(imapConnection, parts, message);
-						if (attachments.length) {
-							newEmail.binary = {};
-							for (let i = 0; i < attachments.length; i++) {
-								newEmail.binary[`${dataPropertyAttachmentsPrefixName}${i}`] = attachments[i];
-							}
-						}
-					}
-
-					newEmails.push(newEmail);
-				}
-			} else if (format === 'raw') {
-				for (const message of results) {
-					if (
-						staticData.lastMessageUid !== undefined &&
-						message.attributes.uid <= (staticData.lastMessageUid as number)
-					) {
-						continue;
-					}
-					if (
-						staticData.lastMessageUid === undefined ||
-						(staticData.lastMessageUid as number) < message.attributes.uid
-					) {
-						staticData.lastMessageUid = message.attributes.uid;
-					}
-					const part = find(message.parts, { which: 'TEXT' });
-
-					if (part === undefined) {
-						throw new NodeOperationError(this.getNode(), 'Email part could not be parsed.');
-					}
-					// Return base64 string
-					newEmail = {
-						json: {
-							raw: part.body as string,
-						},
-					};
-
-					newEmails.push(newEmail);
-				}
-			}
-
-			// only mark messages as seen once processing has finished
-			if (postProcessAction === 'read') {
-				const uidList = results.map((e) => e.attributes.uid);
-				if (uidList.length > 0) {
-					await imapConnection.addFlags(uidList, '\\SEEN');
-				}
-			}
-			return newEmails;
-		};
-
 		const returnedPromise = this.helpers.createDeferredPromise();
 
-		const establishConnection = async (): Promise<ImapSimple> => {
-			let searchCriteria = ['UNSEEN'] as Array<string | string[]>;
-			if (options.customEmailConfig !== undefined) {
-				try {
-					searchCriteria = JSON.parse(options.customEmailConfig as string) as Array<
-						string | string[]
-					>;
-				} catch (error) {
-					throw new NodeOperationError(this.getNode(), 'Custom email config is not valid JSON.');
-				}
-			}
-
-			const config: ImapSimpleOptions = {
-				imap: {
-					user: credentials.user,
-					password: credentials.password,
-					host: credentials.host.trim(),
-					port: credentials.port,
-					tls: credentials.secure,
-					authTimeout: 20000,
-				},
-				onMail: async () => {
-					if (connection) {
-						if (staticData.lastMessageUid !== undefined) {
-							searchCriteria.push(['UID', `${staticData.lastMessageUid as number}:*`]);
-							/**
-							 * A short explanation about UIDs and how they work
-							 * can be found here: https://dev.to/kehers/imap-new-messages-since-last-check-44gm
-							 * TL;DR:
-							 * - You cannot filter using ['UID', 'CURRENT ID + 1:*'] because IMAP
-							 * won't return correct results if current id + 1 does not yet exist.
-							 * - UIDs can change but this is not being treated here.
-							 * If the mailbox is recreated (lets say you remove all emails, remove
-							 * the mail box and create another with same name, UIDs will change)
-							 * - You can check if UIDs changed in the above example
-							 * by checking UIDValidity.
-							 */
-							this.logger.debug('Querying for new messages on node "EmailReadImap"', {
-								searchCriteria,
-							});
-						}
-
-						try {
-							const returnData = await getNewEmails(connection, searchCriteria);
-							if (returnData.length) {
-								this.emit([returnData]);
-							}
-						} catch (error) {
-							this.logger.error('Email Read Imap node encountered an error fetching new emails', {
-								error: error as Error,
-							});
-							// Wait with resolving till the returnedPromise got resolved, else n8n will be unhappy
-							// if it receives an error before the workflow got activated
-							await returnedPromise.promise.then(() => {
-								this.emitError(error as Error);
-							});
-						}
-					}
-				},
-				onUpdate: async (seqNo: number, info) => {
-					this.logger.debug(`Email Read Imap:update ${seqNo}`, info);
-				},
-			};
-
-			const tlsOptions: IDataObject = {};
-
-			if (credentials.allowUnauthorizedCerts) {
-				tlsOptions.rejectUnauthorized = false;
-			}
-
-			if (credentials.secure) {
-				tlsOptions.servername = credentials.host.trim();
-			}
-
-			if (!isEmpty(tlsOptions)) {
-				config.imap.tlsOptions = tlsOptions;
-			}
-
-			// Connect to the IMAP server and open the mailbox
-			// that we get informed whenever a new email arrives
-			return await imapConnect(config).then(async (conn) => {
-				conn.on('close', async (_hadError: boolean) => {
-					if (isCurrentlyReconnecting) {
-						this.logger.debug('Email Read Imap: Connected closed for forced reconnecting');
-					} else if (closeFunctionWasCalled) {
-						this.logger.debug('Email Read Imap: Shutting down workflow - connected closed');
-					} else {
-						this.logger.error('Email Read Imap: Connected closed unexpectedly');
-						this.emitError(new Error('Imap connection closed unexpectedly'));
-					}
-				});
-				conn.on('error', async (error) => {
-					const errorCode = ((error as JsonObject).code as string).toUpperCase();
-					this.logger.debug(`IMAP connection experienced an error: (${errorCode})`, {
-						error: error as Error,
-					});
-					this.emitError(error as Error);
-				});
-				return conn;
-			});
-		};
-
-		connection = await establishConnection();
+		connection = await establishConnection.call(
+			this,
+			options,
+			credentials,
+			staticData,
+			returnedPromise,
+			isCurrentlyReconnecting,
+			closeFunctionWasCalled,
+			connection,
+			postProcessAction,
+			getText,
+			getAttachment,
+		);
 
 		await connection.openBox(mailbox);
 
@@ -648,9 +396,21 @@ export class EmailReadImapV2 implements INodeType {
 			this.logger.debug('Forcing reconnect to IMAP server');
 			try {
 				isCurrentlyReconnecting = true;
-				if (connection.closeBox) await connection.closeBox(false);
-				connection.end();
-				connection = await establishConnection();
+				if (connection?.closeBox) await connection.closeBox(false);
+				connection?.end();
+				connection = await establishConnection.call(
+					this,
+					options,
+					credentials,
+					staticData,
+					returnedPromise,
+					isCurrentlyReconnecting,
+					closeFunctionWasCalled,
+					connection,
+					postProcessAction,
+					getText,
+					getAttachment,
+				);
 				await connection.openBox(mailbox);
 			} catch (error) {
 				this.logger.error(error as string);
@@ -673,8 +433,8 @@ export class EmailReadImapV2 implements INodeType {
 				clearInterval(reconnectionInterval);
 			}
 			try {
-				if (connection.closeBox) await connection.closeBox(false);
-				connection.end();
+				if (connection?.closeBox) await connection.closeBox(false);
+				connection?.end();
 			} catch (error) {
 				throw new TriggerCloseError(this.getNode(), { cause: error as Error, level: 'warning' });
 			}
